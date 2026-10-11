@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "本机浏览器迁移 · Chrome",
+  "version": "0.1.0",
+  "description": "与本机 Python 桌面工具配合进行双向数据迁移。",
+  "minimum_chrome_version": "132",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqMFfp0QmHszQTSkjx/vWn2yuAC7qjIjox0u59WVWoaFtovC1Dn4xAn+jQVMcQU4TWmovwIUE4PFV4+RAVEOBTVbMMyUCQoyRCpjj0WqHfyHezewfKRJkcYS5ljaQ+zMTN7slEYK6hRkwn2KAiI/eHJwBiQXOOa0hu29knzsdW+IzmaxQoN12zxSl1AnyUT6vlCViiuvMzXHXyLD/NFLoFQqaOm0jeHEdb1Si1775vbpJlZqeMXlgHSmGRnTI1rFfiowoBBBRUKVKcctKwgWbxIbzRcj3ZTtuAXEvqZkw2sqxiOtQ35OLlUm7H7p22ysDiP4/AJvcU8n4XzepwDv6JQIDAQAB",
+  "incognito": "not_allowed",
+  "permissions": [
+    "bookmarks",
+    "cookies",
+    "storage",
+    "nativeMessaging"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "action": {
+    "default_title": "浏览器迁移",
+    "default_popup": "bridge.html"
+  }
+}

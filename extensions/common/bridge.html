@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>浏览器迁移 · 本机连接</title>
+  <link rel="stylesheet" href="bridge.css">
+</head>
+<body>
+  <main>
+    <p class="eyebrow">BROWSER TRANSFER</p>
+    <h1>本机迁移连接</h1>
+    <p id="status" role="status">正在连接桌面工具…</p>
+    <p>迁移过程中请保持此页面打开。需要退出浏览器时，桌面工具会提示你。</p>
+    <p class="note">仅通过本机 Native Messaging 通信。此页面不会显示密码或 Cookie 内容。</p>
+    <button id="retry" type="button">重新连接</button>
+  </main>
+  <script src="role.js"></script>
+  <script src="protocol.js"></script>
+  <script src="operations.js"></script>
+  <script src="bridge.js"></script>
+</body>
+</html>
