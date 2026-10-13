@@ -1,8 +1,44 @@
+# Python environments and caches
 .venv/
+venv/
+ENV/
 __pycache__/
 *.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local application data and exports
 runtime/
 backups/
 logs/
 tmp/
-.coverage
+*.log
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite-*
+
+# Local credentials and environment files
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
+*.key
+
+# JavaScript dependencies and build output
+node_modules/
+dist/
+build/
+*.egg-info/
+
+# Editor and operating system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

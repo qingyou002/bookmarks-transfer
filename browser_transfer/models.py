@@ -49,6 +49,7 @@ class Counts:
     updated: int = 0
     skipped: int = 0
     failed: int = 0
+    deleted: int = 0
 
 
 @dataclass

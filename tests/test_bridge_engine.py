@@ -1,4 +1,5 @@
 import json
+import copy
 import os
 import sqlite3
 import struct
@@ -12,6 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from browser_transfer.backup import Backup
+from browser_transfer.bookmarks import StateStore
 from browser_transfer.bridge import Assembler, Broker, EXTENSION_IDS, _read_exact, chunks, pack_message
 from browser_transfer.engine import Engine
 from browser_transfer.models import MigrationError, PROJECT, Profile
@@ -111,8 +113,12 @@ class FakeBroker:
         pass
 
     def rpc(self, browser, operation, payload=None):
+        if operation == "ping":
+            return {"browser": browser, "bookmarkBarVersion": 1}
         if operation == "bookmarks_export":
             return {"tree": [{"id": "0", "children": []}]}
+        if operation == "bookmarks_bar_export":
+            return {"bars": [{"id": "1", "title": "bar", "children": []}]}
         if operation == "cookies_export":
             return {"cookies": []}
         if operation == "mappings_export":
@@ -120,6 +126,45 @@ class FakeBroker:
         if operation in {"bookmarks_import", "cookies_import"}:
             return {"counts": {"added": 0, "updated": 0, "skipped": 0, "failed": 0}}
         return {}
+
+
+class BarBroker(FakeBroker):
+    bars = {}
+    calls = []
+    stale = False
+    partial = False
+    def __init__(self, *_):
+        super().__init__()
+        self.exports = {}
+
+    def rpc(self, browser, operation, payload=None):
+        self.calls.append((browser, operation))
+        if operation == "bookmarks_bar_export":
+            self.exports[browser] = self.exports.get(browser, 0) + 1
+            if self.stale and self.exports[browser] == 2:
+                self.bars[browser][0]["children"].append({"id": "stale", "title": "new", "url": "https://stale.invalid"})
+            return {"bars": copy.deepcopy(self.bars[browser])}
+        if operation == "bookmarks_bar_apply":
+            if self.partial:
+                return {"complete": False, "counts": {"added": 1, "updated": 0, "deleted": 0, "skipped": 0, "failed": 1}}
+            root = next(b for b in self.bars[browser] if b["id"] == payload["barId"])
+            node_ids = {}
+            def build(nodes):
+                result = []
+                for n in nodes:
+                    node_id = n.get("targetId") or ("new-" + n["key"])
+                    node_ids[n["key"]] = node_id
+                    clean = {"id": node_id, "title": n["title"]}
+                    if "url" in n:
+                        clean["url"] = n["url"]
+                    else:
+                        clean["children"] = build(n.get("children", []))
+                    result.append(clean)
+                return result
+            root["children"] = build(payload["tree"])
+            return {"complete": True, "bar": copy.deepcopy(root), "nodeIds": node_ids,
+                    "counts": {**{k: v for k, v in payload["preview"].items() if k != "moved"}, "failed": 0}}
+        return super().rpc(browser, operation, payload)
 
 
 class EngineTests(unittest.TestCase):
@@ -159,7 +204,7 @@ class EngineTests(unittest.TestCase):
             db.execute("INSERT INTO visits(id,url,visit_time,from_visit,transition,segment_id,visit_duration) "
                        "VALUES(10,10,200,0,0,0,0)")
         for source, target in ((self.edge, self.chrome), (self.chrome, self.edge)):
-            report = Engine(prompt=lambda _: "continue").migrate(source, target, ["history", "autofill", "bookmarks", "cookies"])
+            report = Engine(prompt=lambda _: "continue").migrate(source, target, ["history", "autofill", "bookmarks", "cookies"], bookmarks_mode="archive")
             self.assertTrue(all(result["status"] == "success" for result in report["results"].values()), report)
             second = Engine(prompt=lambda _: "continue").migrate(source, target, ["history"])
             self.assertEqual(second["results"]["history"]["counts"]["added"], 0)
@@ -186,3 +231,94 @@ class EngineTests(unittest.TestCase):
         report = Engine(prompt=prompt).migrate(self.chrome, self.edge, ["passwords"])
         self.assertEqual(report["results"]["passwords"]["status"], "skipped")
         self.assertFalse(list((self.root / "runtime/tmp").glob("run-*/*.csv")))
+
+    def setup_bars(self):
+        BarBroker.calls, BarBroker.stale, BarBroker.partial = [], False, False
+        BarBroker.bars = {"Edge": [{"id": "1", "title": "bar", "children": [
+            {"id": "10", "title": "A", "url": "https://a.invalid"}]}],
+            "Chrome": [{"id": "1", "title": "bar", "children": [
+                {"id": "20", "title": "A", "url": "https://a.invalid"},
+                {"id": "21", "title": "remove", "url": "https://remove.invalid"}]}]}
+
+    @staticmethod
+    def bar_prompt(request):
+        return {"base": "source", "choices": {}} if request["kind"] == "bookmark_compare" else "continue"
+
+    def test_main_bar_both_directions_repeat_and_source_not_written(self):
+        self.setup_bars()
+        with patch("browser_transfer.engine.Broker", BarBroker):
+            report = Engine(prompt=self.bar_prompt).migrate(self.edge, self.chrome, ["bookmarks"])
+            self.assertEqual(report["version"], 2)
+            self.assertEqual(report["results"]["bookmarks"]["status"], "success")
+            self.assertEqual(report["results"]["bookmarks"]["counts"]["deleted"], 1)
+            self.assertNotIn(("Edge", "bookmarks_bar_apply"), BarBroker.calls)
+            repeat = Engine(prompt=self.bar_prompt).migrate(self.edge, self.chrome, ["bookmarks"])
+            self.assertEqual(repeat["results"]["bookmarks"]["counts"]["added"], 0)
+            self.assertEqual(repeat["results"]["bookmarks"]["counts"]["deleted"], 0)
+            reverse = Engine(prompt=self.bar_prompt).migrate(self.chrome, self.edge, ["bookmarks"])
+            self.assertEqual(reverse["results"]["bookmarks"]["status"], "success")
+            self.assertEqual(len(list((self.root / "runtime/bookmark-state").glob("*.json"))), 1)
+
+    def test_compare_cancel_is_before_backup_or_browser_writes(self):
+        self.setup_bars()
+        with patch("browser_transfer.engine.Broker", BarBroker):
+            report = Engine(prompt=lambda _: "cancel").migrate(self.edge, self.chrome, ["bookmarks", "history"])
+        self.assertIsNone(report["backup"])
+        self.assertEqual(report["results"]["history"]["status"], "cancelled")
+        self.assertFalse(any(op.endswith("apply") for _, op in BarBroker.calls))
+
+    def test_changed_snapshot_and_partial_writes_do_not_save_baseline(self):
+        for stale, partial in ((True, False), (False, True)):
+            self.setup_bars()
+            BarBroker.stale, BarBroker.partial = stale, partial
+            with patch("browser_transfer.engine.Broker", BarBroker):
+                report = Engine(prompt=self.bar_prompt).migrate(self.edge, self.chrome, ["bookmarks"])
+            self.assertEqual(report["results"]["bookmarks"]["status"], "failed" if stale else "partial")
+            self.assertFalse(list((self.root / "runtime/bookmark-state").glob("*.json")))
+            if stale:
+                self.assertFalse(any(op == "bookmarks_bar_apply" for _, op in BarBroker.calls))
+
+    def test_multiple_bars_selection_only_changes_selected_bar(self):
+        self.setup_bars()
+        BarBroker.bars["Chrome"].append({"id": "2", "title": "account", "syncing": True, "children": []})
+        original = copy.deepcopy(BarBroker.bars["Chrome"][0])
+        kinds = []
+        def prompt(request):
+            kinds.append(request["kind"])
+            if request["kind"] == "bookmark_bars":
+                return {"source": "1", "target": "2"}
+            return self.bar_prompt(request)
+        with patch("browser_transfer.engine.Broker", BarBroker):
+            report = Engine(prompt=prompt).migrate(self.edge, self.chrome, ["bookmarks"])
+        self.assertIn("bookmark_bars", kinds)
+        self.assertEqual(report["results"]["bookmarks"]["status"], "success")
+        self.assertEqual(BarBroker.bars["Chrome"][0], original)
+
+    def test_restore_recovers_all_related_baselines_and_keeps_rollback(self):
+        self.setup_bars()
+        store = StateStore(self.root / "runtime/bookmark-state")
+        existing = {"version": 1, "pairs": [], "snapshots": {self.edge.key: copy.deepcopy(BarBroker.bars["Edge"][0]),
+                                                             self.chrome.key: copy.deepcopy(BarBroker.bars["Chrome"][0])}}
+        key = store.key(self.edge, self.chrome, "other-source", "other-target")
+        store.write(key, existing)
+        (self.chrome.path / "Bookmarks").write_text('{"before":true}', encoding="utf-8")
+        with patch("browser_transfer.engine.Broker", BarBroker):
+            report = Engine(prompt=self.bar_prompt).migrate(self.edge, self.chrome, ["bookmarks"])
+            directory = Path(report["backup"])
+            self.assertEqual(Backup.load(directory).manifest["bookmark_bar_states"], {key: existing})
+            (self.chrome.path / "Bookmarks").write_text('{"after":true}', encoding="utf-8")
+            restored = Engine(prompt=lambda _: "continue").restore(directory)
+        self.assertEqual(restored["status"], "success")
+        self.assertEqual(store.for_profile(self.chrome.key), {key: existing})
+        self.assertEqual(json.loads((self.chrome.path / "Bookmarks").read_text()), {"before": True})
+        rollbacks = [Backup.load(p) for p in (self.root / "backups").iterdir() if p != directory]
+        self.assertTrue(any(len(b.manifest.get("bookmark_bar_states", {})) == 2 for b in rollbacks))
+
+    def test_older_extension_prompts_reload_before_comparison(self):
+        original = FakeBroker.rpc
+        def old_rpc(broker, browser, operation, payload=None):
+            return {"browser": browser} if operation == "ping" else original(broker, browser, operation, payload)
+        with patch.object(FakeBroker, "rpc", old_rpc):
+            report = Engine(prompt=self.bar_prompt).migrate(self.edge, self.chrome, ["bookmarks"])
+        self.assertIsNone(report["backup"])
+        self.assertIn("重新加载", report["results"]["bookmarks"]["message"])

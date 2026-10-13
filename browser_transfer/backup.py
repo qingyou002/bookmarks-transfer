@@ -13,9 +13,11 @@ from .database import connect, integrity
 from .models import MigrationError, Profile, RUNTIME
 from .windows import dpapi, private_dir
 
-ALLOWED_FILES = frozenset({"Bookmarks", "Bookmarks.bak", "History", "Web Data",
-                           "Login Data", "Login Data For Account"})
-SQLITE_FILES = ALLOWED_FILES - {"Bookmarks", "Bookmarks.bak"}
+BOOKMARK_FILES = tuple(name + suffix for name in (
+    "Bookmarks", "AccountBookmarks", "EncryptedBookmarks", "EncryptedAccountBookmarks",
+    "EncryptedBookmarks2", "EncryptedAccountBookmarks2") for suffix in ("", ".bak"))
+SQLITE_FILES = frozenset({"History", "Web Data", "Login Data", "Login Data For Account"})
+ALLOWED_FILES = frozenset(BOOKMARK_FILES) | SQLITE_FILES
 
 
 def write_json(path: Path, data: dict) -> None:
@@ -118,13 +120,16 @@ class Backup:
             if not file.is_file() or file_hash(file) != self.manifest["cookies_sha256"]:
                 raise MigrationError("Cookie 备份校验失败，未开始恢复。")
 
-    def restore_files(self, guard=lambda: None) -> None:
+    def restore_files(self, guard=lambda: None, *, extra_manifest: dict | None = None) -> Backup:
         self.verify()
         profile = Profile.from_dict(self.manifest["target"])
         if not profile.path.is_dir():
             raise MigrationError("备份对应的浏览器配置不存在。")
         # Preserve current state before restoring; undo a partial file replacement on failure.
         rollback = Backup.create(profile, list(self.manifest["files"]), guard=guard)
+        if extra_manifest:
+            rollback.manifest.update(extra_manifest)
+            rollback.save()
         replaced = []
         try:
             for name, info in self.manifest["files"].items():
@@ -138,6 +143,7 @@ class Backup:
                 guard()
                 rollback._restore_file(profile.path, name, rollback.manifest["files"][name])
             raise
+        return rollback
 
     def _restore_file(self, target: Path, name: str, info: dict) -> None:
         path = target / name

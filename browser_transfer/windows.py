@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import csv
 import ctypes
-import io
+from ctypes import wintypes
 import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from .models import MigrationError, Profile
@@ -47,23 +47,150 @@ def discover() -> dict[str, list[Profile]]:
     return result
 
 
-def browser_running(browser: str) -> bool:
+class _PROCESSENTRY32(ctypes.Structure):
+    _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", wintypes.LONG),
+                ("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR * 260)]
+
+
+def _kernel():
     if os.name != "nt":
         raise MigrationError("本工具目前只支持 Windows。")
-    image = {"Edge": "msedge.exe", "Chrome": "chrome.exe"}[browser]
-    proc = subprocess.run(["tasklist.exe", "/FI", f"IMAGENAME eq {image}",
-                           "/FO", "CSV", "/NH"], capture_output=True,
-                          creationflags=CREATE_NO_WINDOW, timeout=15)
-    if proc.returncode:
-        raise MigrationError("无法检查浏览器后台进程，已停止数据库写入。")
-    # Process image names are ASCII; localized tasklist messages are irrelevant.
-    return any(row and row[0].casefold() == image for row in
-               csv.reader(io.StringIO(proc.stdout.decode("utf-8", errors="replace"))))
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    signatures = {
+        "CreateToolhelp32Snapshot": ([wintypes.DWORD, wintypes.DWORD], wintypes.HANDLE),
+        "Process32FirstW": ([wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32)], wintypes.BOOL),
+        "Process32NextW": ([wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32)], wintypes.BOOL),
+        "ProcessIdToSessionId": ([wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
+        "GetCurrentProcessId": ([], wintypes.DWORD),
+        "CloseHandle": ([wintypes.HANDLE], wintypes.BOOL),
+        "OpenProcess": ([wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE),
+        "QueryFullProcessImageNameW": ([wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                        ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
+        "TerminateProcess": ([wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
+    }
+    for name, (args, result) in signatures.items():
+        fn = getattr(kernel, name)
+        fn.argtypes, fn.restype = args, result
+    return kernel
+
+
+def _session(kernel, pid: int) -> int:
+    session = wintypes.DWORD()
+    if not kernel.ProcessIdToSessionId(pid, ctypes.byref(session)):
+        raise MigrationError("无法检查浏览器所属会话，已停止操作。")
+    return session.value
+
+
+def browser_processes(browsers=("Edge", "Chrome")) -> dict[str, list[int]]:
+    """Enumerate exact browser images in this logon session, including background processes."""
+    kernel = _kernel()
+    current = _session(kernel, kernel.GetCurrentProcessId())
+    images = {"msedge.exe": "Edge", "chrome.exe": "Chrome"}
+    result = {browser: [] for browser in dict.fromkeys(browsers)}
+    handle = kernel.CreateToolhelp32Snapshot(2, 0)
+    if handle == ctypes.c_void_p(-1).value:
+        raise MigrationError("无法检查浏览器后台进程，已停止操作。")
+    try:
+        entry = _PROCESSENTRY32()
+        entry.dwSize = ctypes.sizeof(entry)
+        ok = kernel.Process32FirstW(handle, ctypes.byref(entry))
+        if not ok and ctypes.get_last_error() != 18:  # ERROR_NO_MORE_FILES
+            raise MigrationError("无法读取进程列表，已停止操作。")
+        while ok:
+            browser = images.get(entry.szExeFile.casefold())
+            if browser in result:
+                try:
+                    if _session(kernel, entry.th32ProcessID) == current:
+                        result[browser].append(entry.th32ProcessID)
+                except MigrationError:
+                    # A process may disappear between the snapshot and session query.
+                    if ctypes.get_last_error() != 87:
+                        raise
+            ok = kernel.Process32NextW(handle, ctypes.byref(entry))
+        if ctypes.get_last_error() != 18:
+            raise MigrationError("进程列表读取不完整，已停止操作。")
+    finally:
+        kernel.CloseHandle(handle)
+    return result
+
+
+def browser_running(browser: str) -> bool:
+    return bool(browser_processes([browser])[browser])
+
+
+def _request_window_close(pids: set[int]) -> None:
+    user = ctypes.WinDLL("user32", use_last_error=True)
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
+    user.EnumWindows.restype = wintypes.BOOL
+    user.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user.PostMessageW.restype = wintypes.BOOL
+    failed = []
+    @callback_type
+    def visit(hwnd, _):
+        pid = wintypes.DWORD()
+        user.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value in pids and not user.PostMessageW(hwnd, 0x0010, 0, 0):  # WM_CLOSE
+            failed.append(pid.value)
+        return True
+    if not user.EnumWindows(visit, 0) or failed:
+        raise MigrationError("部分浏览器窗口无法正常关闭，请手动退出或重试。")
+
+
+def _terminate_browser(pid: int, browser: str) -> None:
+    kernel = _kernel()
+    handle = kernel.OpenProcess(0x1001, False, pid)  # QUERY_LIMITED_INFORMATION | TERMINATE
+    if not handle:
+        if ctypes.get_last_error() == 87:  # Already exited.
+            return
+        raise MigrationError("无法结束部分浏览器进程，请手动退出后重试。")
+    try:
+        # Validate the opened handle, avoiding killing a reused PID or WebView2.
+        name, size = ctypes.create_unicode_buffer(32768), wintypes.DWORD(32768)
+        if not kernel.QueryFullProcessImageNameW(handle, 0, name, ctypes.byref(size)):
+            raise MigrationError("无法验证浏览器进程，未结束该进程。")
+        expected = {"Edge": "msedge.exe", "Chrome": "chrome.exe"}[browser]
+        if Path(name.value).name.casefold() != expected:
+            raise MigrationError("进程身份发生变化，未结束该进程。")
+        if _session(kernel, pid) != _session(kernel, kernel.GetCurrentProcessId()):
+            raise MigrationError("进程不属于当前会话，未结束该进程。")
+        if not kernel.TerminateProcess(handle, 0):
+            raise MigrationError("浏览器进程结束失败，请手动退出后重试。")
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def close_browser_processes(browsers=("Edge", "Chrome"), *, force=False,
+                            cancelled=None, timeout=10) -> dict[str, int]:
+    """Caller must obtain a separate explicit action before passing force=True."""
+    processes = browser_processes(browsers)
+    if force:
+        for browser, pids in processes.items():
+            for pid in pids:
+                if cancelled is not None and cancelled.is_set():
+                    return {b: len(p) for b, p in browser_processes(browsers).items()}
+                _terminate_browser(pid, browser)
+    else:
+        _request_window_close({pid for pids in processes.values() for pid in pids})
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = {b: len(p) for b, p in browser_processes(browsers).items()}
+        if not any(remaining.values()) or time.monotonic() >= deadline:
+            return remaining
+        if cancelled is not None:
+            if cancelled.wait(0.2):
+                return remaining
+        else:
+            time.sleep(0.2)
 
 
 def assert_closed(*profiles: Profile) -> None:
     if any(browser_running(p.browser) for p in profiles):
-        raise MigrationError("浏览器仍有后台进程；请正常退出后重试。没有强制结束进程。")
+        raise MigrationError("浏览器仍有后台进程；请关闭后重试。")
 
 
 def launch(profile: Profile, url: str | None = None) -> None:

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "本机浏览器迁移 · Edge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "与本机 Python 桌面工具配合进行双向数据迁移。",
   "minimum_chrome_version": "132",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApXUL4eOAcRugm8nhUy2RtbssRauRHDolHjWaqa+Zo/P9pU4RyIKNo0iaYLbZSgs6I2EQrY+6MM124ILgRDdh/6+DxsNk+V0cyME40bkGVq9I3AK6IJSBeQyrNU6CXMb/6w9UG0PXWW8dpOMCeYZzKydehwLYxSbhsNAdAd0vvPQgzyfQ+r0v+APeezsDSulWW5qmPJzJ0QEO8mpbNvLHLiyS2mGgN3T/nOMW4Ame8y8ayTa8C4REjHEbIiscNbrwsG4ZzrI7fAQMKS5rJUPjsTvO20/NC6iEaIrwbtguKEVQKL3yy+eQexcGSSRML4hg47fOIhap5blQ59jy0d92GQIDAQAB",

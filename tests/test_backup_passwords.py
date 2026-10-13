@@ -8,7 +8,7 @@ from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
-from browser_transfer.backup import Backup, snapshot_database
+from browser_transfer.backup import BOOKMARK_FILES, Backup, snapshot_database
 from browser_transfer.models import MigrationError, Profile
 from browser_transfer.passwords import cleanup, csv_batches
 from .fixtures import history
@@ -45,6 +45,21 @@ class BackupPasswordTests(unittest.TestCase):
         with self.assertRaises(MigrationError):
             Backup.load(backup.directory)
         self.assertEqual(file.read_text(encoding="utf-8"), "original")
+
+    def test_account_and_encrypted_bookmark_files_restore_as_bytes(self):
+        profile = Profile("Chrome", self.root / "chrome", "Default")
+        profile.path.mkdir(parents=True)
+        original = {"AccountBookmarks": b'{"account":true}', "EncryptedAccountBookmarks2": b"\0encrypted-test\xff"}
+        for name, data in original.items():
+            (profile.path / name).write_bytes(data)
+        backup = Backup.create(profile, list(BOOKMARK_FILES), root=self.root / "backups")
+        for name in original:
+            (profile.path / name).write_bytes(b"changed")
+        (profile.path / "EncryptedBookmarks2").write_bytes(b"new")
+        Backup.load(backup.directory).restore_files()
+        for name, data in original.items():
+            self.assertEqual((profile.path / name).read_bytes(), data)
+        self.assertFalse((profile.path / "EncryptedBookmarks2").exists())
 
     def test_restore_failure_after_replacement_rolls_back_current_file(self):
         profile = Profile("Chrome", self.root / "chrome", "Default")

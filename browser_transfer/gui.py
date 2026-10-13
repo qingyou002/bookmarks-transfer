@@ -9,6 +9,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from .backup import write_json
+from .bookmark_dialog import BarSelectionDialog, BookmarkCompareDialog
 from .bridge import register_host
 from .cli import environment
 from .engine import Engine, safe_error
@@ -38,6 +39,7 @@ class App:
         self.source_choice = tk.StringVar()
         self.target_choice = tk.StringVar()
         self.selected = {name: tk.BooleanVar(value=True) for name in ITEMS}
+        self.bookmarks_mode = tk.StringVar(value="主书签栏比较")
         self.stage = tk.StringVar(value="就绪 · 请先检查环境并设置扩展")
         self._build()
         self._load_settings()
@@ -58,7 +60,7 @@ class App:
         outer = ttk.Frame(self.root, padding=24)
         outer.pack(fill="both", expand=True)
         ttk.Label(outer, text="浏览器迁移", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(outer, text="Edge ↔ Chrome  ·  每次选择一个方向，保留目标独有数据", style="Note.TLabel").pack(anchor="w", pady=(4, 18))
+        ttk.Label(outer, text="Edge ↔ Chrome  ·  先比较主书签栏，再按确认的选择更新目标", style="Note.TLabel").pack(anchor="w", pady=(4, 18))
         direction = ttk.Frame(outer)
         direction.pack(fill="x")
         self.radios = []
@@ -86,30 +88,38 @@ class App:
             widget = ttk.Checkbutton(options, text=LABELS[name], variable=self.selected[name])
             widget.pack(side="left", padx=(0, 14))
             self.checkboxes.append(widget)
-        ttk.Label(outer, text="冲突使用本次来源；密码需官方导入确认，Cookie 不保证所有网站保持登录。", style="Note.TLabel").pack(anchor="w", pady=(0, 14))
+        mode_row = ttk.Frame(outer)
+        mode_row.pack(fill="x", pady=(0, 8))
+        ttk.Label(mode_row, text="收藏夹模式：").pack(side="left")
+        self.mode_combo = ttk.Combobox(mode_row, textvariable=self.bookmarks_mode, state="readonly", width=30,
+                                      values=("主书签栏比较", "导入到来源专用目录（备份方式）"))
+        self.mode_combo.pack(side="left")
+        ttk.Label(outer, text="关闭前请保存内容，将关闭两边所有配置窗口。密码需官方导入确认，Cookie 不保证登录。",
+                  style="Note.TLabel", wraplength=850).pack(anchor="w", pady=(0, 14))
         buttons = ttk.Frame(outer)
         buttons.pack(fill="x")
         self.check_button = ttk.Button(buttons, text="环境检查", command=self._check)
         self.setup_button = ttk.Button(buttons, text="扩展设置", command=self._setup)
+        self.close_button = ttk.Button(buttons, text="关闭两边浏览器", command=self._close_browsers)
         self.start_button = ttk.Button(buttons, text="开始迁移", command=self._start)
         self.cancel_button = ttk.Button(buttons, text="停止后续步骤", command=self._cancel, state="disabled")
         self.restore_button = ttk.Button(buttons, text="恢复备份", command=self._restore)
         self.result_button = ttk.Button(buttons, text="查看结果", command=self._view_result)
-        for button in (self.check_button, self.setup_button, self.start_button, self.cancel_button,
+        for button in (self.check_button, self.setup_button, self.close_button, self.start_button, self.cancel_button,
                        self.restore_button, self.result_button):
             button.pack(side="left", padx=(0, 8))
         ttk.Label(outer, textvariable=self.stage, style="Note.TLabel").pack(anchor="w", pady=(18, 6))
         self.progress = ttk.Progressbar(outer, mode="indeterminate")
         self.progress.pack(fill="x", pady=(0, 12))
-        self.table = ttk.Treeview(outer, columns=("item", "status", "added", "updated", "skipped", "failed"),
+        self.table = ttk.Treeview(outer, columns=("item", "status", "added", "updated", "deleted", "skipped", "failed"),
                                   show="headings", height=5, selectmode="browse")
         for name, label, width in (("item", "数据", 180), ("status", "状态", 140),
                                    ("added", "新增", 80), ("updated", "更新", 80),
-                                   ("skipped", "跳过", 80), ("failed", "失败", 80)):
+                                   ("deleted", "删除", 80), ("skipped", "跳过", 80), ("failed", "失败", 80)):
             self.table.heading(name, text=label)
             self.table.column(name, width=width, anchor="w" if name == "item" else "center")
         for name in ITEMS:
-            self.table.insert("", "end", iid=name, values=(LABELS[name], "未开始", "—", "—", "—", "—"))
+            self.table.insert("", "end", iid=name, values=(LABELS[name], "未开始", "—", "—", "—", "—", "—"))
         self.table.pack(fill="x")
         self.table.bind("<<TreeviewSelect>>", self._selected_result)
         log_frame = ttk.Frame(outer)
@@ -127,6 +137,8 @@ class App:
             self.saved = json.loads((RUNTIME / "settings.json").read_text(encoding="utf-8"))
             if self.saved.get("source") in {"Edge", "Chrome"}:
                 self.direction.set(self.saved["source"])
+            if self.saved.get("bookmarks_mode") == "archive":
+                self.bookmarks_mode.set("导入到来源专用目录（备份方式）")
             for name, variable in self.selected.items():
                 variable.set(name in self.saved.get("items", ITEMS))
         except (OSError, ValueError):
@@ -163,10 +175,10 @@ class App:
 
     def _set_busy(self, value):
         self.busy = value
-        for widget in (self.check_button, self.setup_button, self.start_button, self.restore_button,
+        for widget in (self.check_button, self.setup_button, self.close_button, self.start_button, self.restore_button,
                        *self.radios, *self.checkboxes):
             widget.configure(state="disabled" if value else "normal")
-        for combo in (self.source_combo, self.target_combo):
+        for combo in (self.source_combo, self.target_combo, self.mode_combo):
             combo.configure(state="disabled" if value else "readonly")
         self.cancel_button.configure(state="normal" if value else "disabled")
         if value:
@@ -208,13 +220,15 @@ class App:
                 messagebox.showinfo("请选择数据", "至少勾选一个迁移项目。", parent=self.root)
                 return
             private_dir(RUNTIME)
+            mode = "bar" if self.bookmarks_mode.get() == "主书签栏比较" else "archive"
             self.saved = {"source": source.browser, "profiles": {source.browser: source.directory,
-                                                                  target.browser: target.directory}, "items": items}
+                                                                  target.browser: target.directory}, "items": items,
+                          "bookmarks_mode": mode}
             write_json(RUNTIME / "settings.json", self.saved)
             for name in ITEMS:
-                self.table.item(name, values=(LABELS[name], "等待" if name in items else "未选择", 0, 0, 0, 0))
+                self.table.item(name, values=(LABELS[name], "等待" if name in items else "未选择", 0, 0, 0, 0, 0))
             self.report = None
-            self._worker(lambda: self._engine().migrate(source, target, items))
+            self._worker(lambda: self._engine().migrate(source, target, items, bookmarks_mode=mode))
         except Exception as exc:
             messagebox.showerror("无法开始", safe_error(exc), parent=self.root)
 
@@ -224,6 +238,11 @@ class App:
         self._append("已请求停止后续步骤。")
         if self.prompt_reply:
             self.prompt_reply("cancel")
+
+    def _close_browsers(self):
+        profiles = [values[0] for values in self.profiles.values() if values]
+        if profiles:
+            self._worker(lambda: self._engine().close_browsers(profiles, initial_action="close_normal"))
 
     def _check(self):
         def job():
@@ -277,6 +296,21 @@ class App:
 
     def _show_prompt(self, event):
         request = event["request"]
+        if request["kind"] in {"bookmark_bars", "bookmark_compare"}:
+            def reply(value):
+                if event["ready"].is_set():
+                    return
+                event["response"]["answer"] = value
+                event["ready"].set()
+                self.prompt_reply = None
+                self.prompt_window = None
+                dialog.destroy()
+            cls = BookmarkCompareDialog if request["kind"] == "bookmark_compare" else BarSelectionDialog
+            dialog = cls(self.root, request, reply)
+            self.prompt_reply, self.prompt_window = reply, dialog
+            dialog.protocol("WM_DELETE_WINDOW", lambda: reply("cancel"))
+            dialog.grab_set()
+            return
         dialog = tk.Toplevel(self.root)
         self.prompt_window = dialog
         dialog.title("需要你完成一个步骤")
@@ -287,6 +321,10 @@ class App:
         ttk.Label(box, text=request["message"], wraplength=620, justify="left").pack(anchor="w", pady=(0, 12))
         file_var = tk.StringVar(value=request.get("file", ""))
         kind = request["kind"]
+        if kind == "close":
+            remaining = request.get("remaining")
+            if remaining is not None:
+                ttk.Label(box, text="剩余进程：" + "；".join(f"{b} {n}" for b, n in remaining.items())).pack(anchor="w", pady=8)
         if "file" in request:
             ttk.Label(box, text="CSV 文件路径：").pack(anchor="w")
             ttk.Entry(box, textvariable=file_var, width=76, state="normal" if kind == "password_export" else "readonly").pack(fill="x", pady=6)
@@ -324,7 +362,13 @@ class App:
                 answer(file_var.get())
             else:
                 answer("done" if kind == "password_confirm" else "continue")
-        ttk.Button(buttons, text="已完成导入" if kind == "password_confirm" else "继续", command=proceed).pack(side="left")
+        if kind == "close":
+            ttk.Button(buttons, text="正常关闭浏览器", command=lambda: answer("close_normal")).pack(side="left", padx=(0, 8))
+            if request.get("can_force"):
+                ttk.Button(buttons, text="强制结束剩余进程", command=lambda: answer("close_force")).pack(side="left", padx=(0, 8))
+            ttk.Button(buttons, text="已手动退出，检查并继续", command=proceed).pack(side="left")
+        else:
+            ttk.Button(buttons, text="已完成导入" if kind == "password_confirm" else "继续", command=proceed).pack(side="left")
         if kind.startswith("password"):
             ttk.Button(buttons, text="跳过密码", command=lambda: answer("skip")).pack(side="left", padx=8)
         ttk.Button(buttons, text="取消后续步骤", command=lambda: answer("cancel")).pack(side="right")
@@ -372,7 +416,7 @@ class App:
     def _row_result(self, name, result):
         counts = result["counts"]
         values = (LABELS[name], STATUS.get(result["status"], result["status"]))
-        values += ("—", "—", "—", "—") if name == "passwords" else tuple(counts[k] for k in ("added", "updated", "skipped", "failed"))
+        values += ("—",) * 5 if name == "passwords" else tuple(counts.get(k, 0) for k in ("added", "updated", "deleted", "skipped", "failed"))
         self.table.item(name, values=values)
         self._append(f"{LABELS[name]}：{result['message']}")
 

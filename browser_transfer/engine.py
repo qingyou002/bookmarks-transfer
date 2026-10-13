@@ -6,12 +6,13 @@ import uuid
 from pathlib import Path
 from urllib.parse import urlencode
 
-from .backup import Backup, write_json
+from .backup import BOOKMARK_FILES, Backup, write_json
+from .bookmarks import Comparison, StateStore, fingerprint, select_bar
 from .bridge import Broker, EXTENSION_IDS, RunLock, host_registered
 from .database import merge_autofill, merge_history
 from .models import Cancelled, Counts, ITEMS, LABELS, MigrationError, Profile, RUNTIME, Result
 from .passwords import cleanup, csv_batches
-from .windows import assert_closed, launch, private_dir
+from .windows import assert_closed, browser_processes, close_browser_processes, launch, private_dir
 
 
 def safe_error(exc: BaseException) -> str:
@@ -26,6 +27,7 @@ class Engine:
         self.emit, self.prompt = emit, prompt
         self.cancelled = cancelled or threading.Event()
         self.broker = None
+        self.bridge_info = {}
 
     def event(self, message: str, **fields):
         self.emit({"type": "progress", "message": message, **fields})
@@ -34,7 +36,7 @@ class Engine:
         if self.cancelled.is_set():
             raise Cancelled("已停止后续步骤；已完成的迁移仍然保留。")
 
-    def ask(self, kind: str, message: str, **fields) -> str:
+    def ask(self, kind: str, message: str, **fields):
         self.check_cancel()
         answer = self.prompt({"kind": kind, "message": message, **fields})
         if answer == "cancel":
@@ -42,16 +44,85 @@ class Engine:
             self.check_cancel()
         return answer
 
-    def close_browsers(self, profiles: list[Profile]):
+    def close_browsers(self, profiles: list[Profile], *, initial_action=None):
+        browsers = list(dict.fromkeys(p.browser for p in profiles))
+        remaining = None
+        can_force = False
         while True:
-            self.ask("close", "请保存正在编辑的内容，然后正常退出 " +
-                     "、".join(p.browser for p in profiles) +
-                     "（包括后台进程）。本工具不会强制关闭。", profiles=[p.to_dict() for p in profiles])
+            self.check_cancel()
+            if initial_action == "close_normal":
+                answer, initial_action = initial_action, None
+            else:
+                answer = self.ask("close", "请先保存正在编辑的内容。关闭操作会处理当前 Windows 会话中 " +
+                         "、".join(browsers) + " 的所有配置窗口及后台进程。先正常关闭；仍有进程时可另点“强制结束剩余进程”。",
+                         profiles=[p.to_dict() for p in profiles], remaining=remaining, can_force=can_force)
             try:
+                if answer == "close_normal" or (answer == "close_force" and can_force):
+                    self.event("正在" + ("强制结束剩余浏览器进程。" if answer == "close_force" else "请求正常关闭浏览器，最多等待 10 秒。"))
+                    remaining = close_browser_processes(browsers, force=answer == "close_force",
+                                                        cancelled=self.cancelled)
+                    self.check_cancel()
+                    can_force = bool(any(remaining.values()))
+                    self.event("剩余进程：" + "；".join(f"{b} {n}" for b, n in remaining.items()))
                 assert_closed(*profiles)
                 return
             except MigrationError as exc:
+                if isinstance(exc, Cancelled):
+                    raise
                 self.event(str(exc))
+                try:
+                    remaining = {b: len(pids) for b, pids in browser_processes(browsers).items()}
+                    if answer == "close_normal":
+                        can_force = bool(any(remaining.values()))
+                except MigrationError:
+                    remaining, can_force = None, False
+
+    def prepare_bookmark_bar(self, source: Profile, target: Profile) -> dict:
+        for profile in (source, target):
+            if self.bridge_info.get(profile.browser, {}).get("bookmarkBarVersion") != 1:
+                raise MigrationError(f"请在 {profile.browser} 的扩展页面重新加载本工具 0.2.0 扩展，然后重试主书签栏比较。")
+        left = self.broker.rpc(source.browser, "bookmarks_bar_export")
+        right = self.broker.rpc(target.browser, "bookmarks_bar_export")
+        if not left.get("bars") or not right.get("bars"):
+            raise MigrationError("没有找到双方可识别的主书签栏，未开始迁移。")
+        if len(left["bars"]) > 1 or len(right["bars"]) > 1:
+            answer = self.ask("bookmark_bars", "请选择本次比较的来源和目标书签栏。",
+                              source_bars=left["bars"], target_bars=right["bars"],
+                              source_browser=source.browser, target_browser=target.browser)
+            if not isinstance(answer, dict):
+                raise MigrationError("未选择参与比较的书签栏。")
+        else:
+            answer = {"source": left["bars"][0]["id"], "target": right["bars"][0]["id"]}
+        source_bar, target_bar = select_bar(left, answer["source"]), select_bar(right, answer["target"])
+        store = StateStore(RUNTIME / "bookmark-state")
+        key = store.key(source, target, source_bar["id"], target_bar["id"])
+        state = store.read(key)
+        comparison = Comparison(source_bar, target_bar, source.key, target.key, state)
+        decision = self.ask("bookmark_compare", "选择整栏基准，再设置需要保留的逐项例外。应用只修改目标主书签栏。",
+                            comparison=comparison, source_browser=source.browser, target_browser=target.browser)
+        if not isinstance(decision, dict):
+            raise MigrationError("尚未确认书签栏差异，未开始迁移。")
+        return {"comparison": comparison, "plan": comparison.resolve(decision),
+                "store": store, "key": key, "before": state}
+
+    def apply_bookmark_bar(self, source: Profile, target: Profile, prepared: dict) -> Result:
+        comparison, plan = prepared["comparison"], prepared["plan"]
+        for profile, before in ((source, comparison.source), (target, comparison.target)):
+            current = select_bar(self.broker.rpc(profile.browser, "bookmarks_bar_export"), before["id"])
+            if fingerprint(current) != fingerprint(before):
+                return Result("failed", Counts(failed=1), "书签栏在确认后发生变化，未写入；请重新比较后迁移。")
+        response = self.broker.rpc(target.browser, "bookmarks_bar_apply", plan)
+        counts = Counts(**response["counts"])
+        if not response.get("complete") or counts.failed:
+            message = ("书签栏在执行前发生变化，未写入；请重新比较。" if response.get("reason") == "stale-snapshot"
+                       else "书签栏部分操作未完成，比较基线未更新；请重新比较或恢复备份。")
+            return Result("partial" if counts.added or counts.updated or counts.deleted else "failed", counts, message)
+        try:
+            prepared["store"].write(prepared["key"], comparison.state_after(response["bar"], response["nodeIds"]))
+        except Exception as exc:
+            counts.failed += 1
+            return Result("partial", counts, "目标书签栏已更新，但比较状态保存失败；请恢复备份或重新比较。" + safe_error(exc))
+        return Result("success", counts, "已按确认的选择更新目标主书签栏。")
 
     def open_bridges(self, profiles: list[Profile]):
         if not host_registered():
@@ -64,7 +135,7 @@ class Engine:
         self.event("等待扩展连接，请保持浏览器连接页面打开。")
         self.broker.wait_ready([p.browser for p in profiles])
         for profile in profiles:
-            self.broker.rpc(profile.browser, "ping")
+            self.bridge_info[profile.browser] = self.broker.rpc(profile.browser, "ping")
 
     def _cleanup_stale(self):
         tmp = private_dir(RUNTIME / "tmp")
@@ -72,12 +143,14 @@ class Engine:
             if directory.is_dir():
                 cleanup(directory)
 
-    def migrate(self, source: Profile, target: Profile, items: list[str]) -> dict:
+    def migrate(self, source: Profile, target: Profile, items: list[str], *, bookmarks_mode="bar") -> dict:
         if source.browser == target.browser:
             raise MigrationError("请选择不同的源浏览器和目标浏览器。")
         if not items or not set(items) <= set(ITEMS):
             raise MigrationError("至少选择一个有效迁移项目。")
-        report = {"version": 1, "direction": f"{source.browser} → {target.browser}",
+        if bookmarks_mode not in {"bar", "archive"}:
+            raise MigrationError("收藏夹模式不受支持。")
+        report = {"version": 2, "direction": f"{source.browser} → {target.browser}", "bookmarks_mode": bookmarks_mode,
                   "results": {name: Result().to_dict() for name in items}, "backup": None}
         results = {name: Result() for name in items}
         backup = None
@@ -86,12 +159,15 @@ class Engine:
             self._cleanup_stale()
             try:
                 self.check_cancel()
-                self.event(f"准备 {source.browser} → {target.browser}；目标独有数据保留。")
+                self.event(f"准备 {source.browser} → {target.browser}。")
                 online = {"bookmarks", "cookies"} & set(items)
                 if online:
                     self.open_bridges([source, target])
                     if "bookmarks" in items:
-                        snapshots["bookmarks"] = self.broker.rpc(source.browser, "bookmarks_export")
+                        if bookmarks_mode == "bar":
+                            snapshots["bar"] = self.prepare_bookmark_bar(source, target)
+                        else:
+                            snapshots["bookmarks"] = self.broker.rpc(source.browser, "bookmarks_export")
                         snapshots["mappings"] = self.broker.rpc(target.browser, "mappings_export")
                     if "cookies" in items:
                         snapshots["source_cookies"] = self.broker.rpc(source.browser, "cookies_export")["cookies"]
@@ -102,7 +178,7 @@ class Engine:
                 files = []
                 for name in items:
                     files += {"history": ["History"], "autofill": ["Web Data"],
-                              "bookmarks": ["Bookmarks", "Bookmarks.bak"],
+                              "bookmarks": list(BOOKMARK_FILES),
                               "passwords": ["Login Data", "Login Data For Account"],
                               "cookies": []}[name]
                 self.event("正在备份目标数据。")
@@ -111,6 +187,8 @@ class Engine:
                 backup.manifest["direction"] = report["direction"]
                 if "mappings" in snapshots:
                     backup.manifest["bookmark_mappings"] = snapshots["mappings"].get("bookmarkMappings", {})
+                if "bookmarks" in items:
+                    backup.manifest["bookmark_bar_states"] = StateStore(RUNTIME / "bookmark-state").for_profile(target.key)
                 backup.save()
                 if "cookies" in items:
                     backup.save_cookies(snapshots["target_cookies"], snapshots["source_cookies"])
@@ -142,11 +220,14 @@ class Engine:
                         self.check_cancel()
                         self.event(f"正在合并{LABELS[name]}。", item=name)
                         try:
-                            response = self.broker.rpc(target.browser, operation, payload)
-                            counts = Counts(**response["counts"])
-                            results[name] = Result("partial" if counts.failed else "success", counts,
-                                                   "已处理；网站是否保持登录请在浏览器中验证。" if
-                                                   name == "cookies" else "已合并到来源浏览器专用目录。")
+                            if name == "bookmarks" and bookmarks_mode == "bar":
+                                results[name] = self.apply_bookmark_bar(source, target, snapshots["bar"])
+                            else:
+                                response = self.broker.rpc(target.browser, operation, payload)
+                                counts = Counts(**response["counts"])
+                                results[name] = Result("partial" if counts.failed else "success", counts,
+                                                       "已处理；网站是否保持登录请在浏览器中验证。" if
+                                                       name == "cookies" else "已合并到来源浏览器专用目录。")
                         except Exception as exc:
                             results[name] = Result("failed", Counts(failed=1), safe_error(exc))
                         self.emit({"type": "result", "item": name, "result": results[name].to_dict()})
@@ -226,14 +307,23 @@ class Engine:
             self.ask("restore", "将恢复此备份中的目标本地数据；备份之后的相关修改会被撤回。当前数据会先另存备份。"
                      " 已同步到云端的修改不能保证撤销。", target=target.to_dict(), directory=str(directory))
             cookies = backup.read_cookies()  # Check DPAPI before any changes.
+            restore_bookmarks = bool(set(BOOKMARK_FILES) & set(backup.manifest["files"]))
+            bar_states = backup.manifest.get("bookmark_bar_states", {})
+            store = StateStore(RUNTIME / "bookmark-state")
+            if restore_bookmarks:
+                store.validate_profile_states(target.key, bar_states)
+                current_states = store.for_profile(target.key)
             if (cookies is not None or "bookmark_mappings" in backup.manifest) and not host_registered():
                 raise MigrationError("恢复此备份需要扩展通信，请先完成扩展设置。尚未恢复文件。")
             self.close_browsers([target])
             self.check_cancel()
             self.event("正在恢复目标本地文件。")
-            backup.restore_files(guard=lambda: assert_closed(target))
+            rollback = backup.restore_files(guard=lambda: assert_closed(target),
+                                            extra_manifest={"bookmark_bar_states": current_states} if restore_bookmarks else None)
             report = {"restored": str(directory), "target": target.browser, "status": "success"}
             try:
+                if restore_bookmarks:
+                    store.restore_profile(target.key, bar_states)
                 if cookies is not None or "bookmark_mappings" in backup.manifest:
                     self.open_bridges([target])
                     if "bookmark_mappings" in backup.manifest:
@@ -249,7 +339,7 @@ class Engine:
                 self.event("恢复流程结束。")
             except Exception as exc:
                 report["status"] = "partial"
-                report["message"] = "本地文件已恢复，但扩展阶段未全部完成：" + safe_error(exc)
+                report["message"] = "本地文件已恢复，但比较状态或扩展阶段未全部完成：" + safe_error(exc)
             finally:
                 if self.broker:
                     self.broker.close()

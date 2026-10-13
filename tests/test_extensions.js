@@ -16,9 +16,22 @@ function fakeBrowser() {
   ]);
   const cookies = new Map();
   const clone = obj => JSON.parse(JSON.stringify(obj));
+  function siblings(parentId) {
+    return [...nodes.values()].filter(n => n.parentId === parentId).sort((a, b) => a.index - b.index);
+  }
+  for (const id of ["0", "1", "2"]) siblings(id).forEach((n, i) => { n.index = i; });
+  function place(node, parentId, position) {
+    const oldParent = node.parentId;
+    const children = siblings(parentId).filter(n => n.id !== node.id);
+    const index = position === undefined ? children.length : Math.min(position, children.length);
+    children.splice(index, 0, node);
+    node.parentId = parentId;
+    children.forEach((n, i) => { n.index = i; });
+    if (oldParent !== parentId) siblings(oldParent).forEach((n, i) => { n.index = i; });
+  }
   function tree(id) {
     const node = clone(nodes.get(id));
-    if (!node.url) node.children = [...nodes.values()].filter(n => n.parentId === id).map(n => tree(n.id));
+    if (!node.url) node.children = siblings(id).map(n => tree(n.id));
     return node;
   }
   const chrome = {
@@ -28,9 +41,37 @@ function fakeBrowser() {
     }},
     bookmarks: {
       getTree: async () => [tree("0")],
-      create: async values => {const node = {id: String(next++), ...values}; nodes.set(node.id, node); return clone(node);},
-      update: async (id, values) => {Object.assign(nodes.get(id), values); return clone(nodes.get(id));},
-      move: async (id, values) => {Object.assign(nodes.get(id), values); return clone(nodes.get(id));},
+      getSubTree: async id => nodes.has(id) ? [tree(id)] : [],
+      get: async id => nodes.has(id) ? [clone(nodes.get(id))] : [],
+      create: async values => {
+        const node = {id: String(next++), ...values};
+        nodes.set(node.id, node); place(node, values.parentId, values.index); return clone(node);
+      },
+      update: async (id, values) => {
+        if (nodes.get(id).unmodifiable) throw new Error("managed-node");
+        Object.assign(nodes.get(id), values); return clone(nodes.get(id));
+      },
+      move: async (id, values) => {
+        if (nodes.get(id).unmodifiable) throw new Error("managed-node");
+        let ancestor = values.parentId;
+        while (ancestor) {
+          if (ancestor === id) throw new Error("cycle");
+          ancestor = nodes.get(ancestor)?.parentId;
+        }
+        place(nodes.get(id), values.parentId, values.index); return clone(nodes.get(id));
+      },
+      remove: async id => {
+        if (nodes.get(id).unmodifiable) throw new Error("managed-node");
+        const parent = nodes.get(id).parentId;
+        nodes.delete(id); siblings(parent).forEach((n, i) => { n.index = i; });
+      },
+      removeTree: async id => {
+        for (const child of siblings(id)) {
+          if (child.url) await chrome.bookmarks.remove(child.id);
+          else await chrome.bookmarks.removeTree(child.id);
+        }
+        await chrome.bookmarks.remove(id);
+      },
     },
     cookies: {
       getAll: async () => clone([...cookies.values()]),
@@ -104,4 +145,5 @@ async function main() {
   assert.equal(value.value, "中文🙂".repeat(100000));
   console.log("Extension behavior checks passed (bookmarks, reverse transfer, cookies, restore, large messages).");
 }
-main().catch(error => { console.error(error); process.exitCode = 1; });
+if (require.main === module) main().catch(error => { console.error(error); process.exitCode = 1; });
+module.exports = {fakeBrowser};

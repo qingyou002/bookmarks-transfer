@@ -19,7 +19,7 @@ def build():
                 shutil.copyfile(source, target / source.name)
         (target / "role.js").write_text(f'"use strict";\nconst BROWSER_KIND = "{browser}";\n', encoding="utf-8")
         manifest = {"manifest_version": 3, "name": f"本机浏览器迁移 · {browser}",
-                    "version": "0.1.0", "description": "与本机 Python 桌面工具配合进行双向数据迁移。",
+                    "version": "0.2.0", "description": "与本机 Python 桌面工具配合进行双向数据迁移。",
                     "minimum_chrome_version": "132", "key": key, "incognito": "not_allowed",
                     "permissions": ["bookmarks", "cookies", "storage", "nativeMessaging"],
                     "host_permissions": ["http://*/*", "https://*/*"],
